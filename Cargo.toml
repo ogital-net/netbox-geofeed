@@ -1,0 +1,31 @@
+[package]
+name = "netbox-geofeed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+dotenvy = "0.15.7"
+getopt-iter = "1.0.1"
+thiserror = "2.0.18"
+tokio = { version = "1.52.2", features = ["rt", "macros"] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+netbox-client = {git = "https://github.com/ogital-net/netbox-client.git", branch = "main", default-features = false, features = ["sonic-rs"]}
+arcgis-geocoder = {git = "https://github.com/ogital-net/arcgis-geocoder.git", branch = "main", default-features = false, features = ["sonic-rs"]}
+csv = "1"
+futures-util = "0.3"
+json-ts = { git = "https://github.com/ogital-net/json-ts" }
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls"] }
+aws-lc-rs = "1"
+sonic-rs = "0.5.8"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

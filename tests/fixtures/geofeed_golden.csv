@@ -1,0 +1,9 @@
+# netbox-geofeed 0.1.0 (abc1234)
+# Self-published geofeed as defined in datatracker.ietf.org/doc/html/rfc8805
+# Last updated (rfc3339): 2024-01-01T00:00:00Z
+# Number of records: 4, checksum of the actual content minus comments:
+# SHA256 = a0945cedccf24286fc9aa85efb53ec8fca58dfb8eef091c504c18c899dce8a3c
+10.0.0.0/8,US,,,
+10.1.0.0/16,US-CA,San Francisco,,
+192.168.0.0/24,GB-ENG,London,,
+2001:db8::/32,DE-BE,Berlin,,
