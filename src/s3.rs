@@ -121,21 +121,23 @@ async fn put_object_to(
     let payload_hash = hex_sha256(&content);
 
     // Canonical headers (must be sorted by lowercase header name).
-    let mut headers: Vec<(String, String)> = vec![
-        ("cache-control".into(), CACHE_CONTROL.into()),
-        ("content-type".into(), CONTENT_TYPE.into()),
-        ("host".into(), host.to_owned()),
-        ("x-amz-content-sha256".into(), payload_hash.clone()),
-        ("x-amz-date".into(), amz_date.clone()),
+    // (&'static str, &str) works because every value is borrowed from a local
+    // String or a 'static constant, all of which outlive the `headers` vec.
+    let mut headers: Vec<(&'static str, &str)> = vec![
+        ("cache-control", CACHE_CONTROL),
+        ("content-type", CONTENT_TYPE),
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash.as_str()),
+        ("x-amz-date", amz_date.as_str()),
     ];
     if let Some(tok) = &cfg.session_token {
-        headers.push(("x-amz-security-token".into(), tok.clone()));
+        headers.push(("x-amz-security-token", tok.as_str()));
     }
-    headers.sort_by(|a, b| a.0.cmp(&b.0));
+    headers.sort_by(|a, b| a.0.cmp(b.0));
 
     let signed_headers = headers
         .iter()
-        .map(|(k, _)| k.as_str())
+        .map(|(k, _)| *k)
         .collect::<Vec<_>>()
         .join(";");
 
@@ -167,10 +169,10 @@ async fn put_object_to(
     let mut req = client.put(&url).body(content);
     for (k, v) in &headers {
         // Skip Host — reqwest sets it from the URL.
-        if k == "host" {
+        if *k == "host" {
             continue;
         }
-        req = req.header(k, v);
+        req = req.header(*k, *v);
     }
     req = req.header("authorization", authorization);
 

@@ -13,6 +13,7 @@
 //! prefixes) or the aggregate CIDR string (for aggregates), keeping output
 //! stable across runs with identical input.
 
+use std::borrow::Cow;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -34,9 +35,9 @@ pub struct Record {
     pub city: Option<String>,
     // Pre-computed sort fields; kept private to enforce construction through
     // the provided constructors.
-    sort_family: u8,        // 0 = IPv4, 1 = IPv6, 2 = unparseable (fallback)
-    sort_addr: u128,        // network address as an unsigned integer
-    sort_secondary: String, // site slug or aggregate CIDR
+    sort_family: u8,          // 0 = IPv4, 1 = IPv6, 2 = unparseable (fallback)
+    sort_addr: u128,          // network address as an unsigned integer
+    sort_secondary: Option<String>, // Some(site_slug) for site prefixes; None for aggregates (falls back to prefix)
 }
 
 impl Record {
@@ -59,7 +60,7 @@ impl Record {
             city: city.map(str::to_owned),
             sort_family,
             sort_addr,
-            sort_secondary: site_slug.to_owned(),
+            sort_secondary: Some(site_slug.to_owned()),
         }
     }
 
@@ -77,16 +78,19 @@ impl Record {
             city: None,
             sort_family,
             sort_addr,
-            sort_secondary: prefix.to_owned(),
+            sort_secondary: None,
         }
     }
 
     /// Return the region column value: `<country>-<region>` when a region is
-    /// known, or an empty string otherwise.
-    fn region_field(&self) -> String {
+    /// known, or an empty string slice otherwise.
+    ///
+    /// Returns `Cow::Borrowed("")` for records without a region to avoid
+    /// heap-allocating an empty string on every such row.
+    fn region_field(&self) -> Cow<'_, str> {
         match &self.region {
-            Some(r) if !r.is_empty() => format!("{}-{}", self.country, r),
-            _ => String::new(),
+            Some(r) if !r.is_empty() => Cow::Owned(format!("{}-{}", self.country, r)),
+            _ => Cow::Borrowed(""),
         }
     }
 }
@@ -111,11 +115,11 @@ fn addr_sort_key(prefix_cidr: &str) -> (u8, u128) {
 /// site slug / aggregate CIDR.
 pub fn sort(records: &mut [Record]) {
     records.sort_by(|a, b| {
-        (a.sort_family, a.sort_addr, a.sort_secondary.as_str()).cmp(&(
-            b.sort_family,
-            b.sort_addr,
-            b.sort_secondary.as_str(),
-        ))
+        // Aggregates have no explicit secondary key; fall back to the prefix
+        // CIDR string (same value that was previously duplicated into sort_secondary).
+        let a_sec = a.sort_secondary.as_deref().unwrap_or(&a.prefix);
+        let b_sec = b.sort_secondary.as_deref().unwrap_or(&b.prefix);
+        (a.sort_family, a.sort_addr, a_sec).cmp(&(b.sort_family, b.sort_addr, b_sec))
     });
 }
 
@@ -167,7 +171,7 @@ pub fn write_feed<W: io::Write>(
             wtr.write_record([
                 record.prefix.as_str(),
                 record.country.as_str(),
-                &region,
+                &*region, // deref Cow<str> → &str; no allocation when region is absent
                 city,
                 "",
             ])
@@ -368,10 +372,16 @@ mod tests {
             Record::from_aggregate("10.0.0.0/8", "US"),
         ];
         sort(&mut records);
-        // aggregate secondary = "10.0.0.0/8"; site secondary = "zzz"
+        // aggregate secondary = None → falls back to "10.0.0.0/8"; site secondary = Some("zzz")
         // "10.0.0.0/8" < "zzz" lexicographically
-        assert_eq!(records[0].sort_secondary, "10.0.0.0/8");
-        assert_eq!(records[1].sort_secondary, "zzz");
+        assert_eq!(
+            records[0].sort_secondary.as_deref().unwrap_or(&records[0].prefix),
+            "10.0.0.0/8"
+        );
+        assert_eq!(
+            records[1].sort_secondary.as_deref().unwrap_or(&records[1].prefix),
+            "zzz"
+        );
     }
 
     // ── region_field ─────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@
 //! builds sorted RFC 8805 records, and writes the geofeed to stdout
 //! (`--dry-run`) or S3 (normal run — implemented in M6).
 
+use std::borrow::Cow;
 use std::io::{self};
 use std::time::Instant;
 
@@ -55,14 +56,14 @@ pub(crate) async fn run_impl<W: io::Write>(
     let mut netbox = Netbox::new(&args.global.netbox_url, &args.global.netbox_token)
         .context("failed to initialise NetBox client")?;
 
-    let target: String = if args.dry_run {
-        "stdout (dry-run)".to_owned()
+    let target: Cow<str> = if args.dry_run {
+        Cow::Borrowed("stdout (dry-run)")
     } else {
-        format!(
+        Cow::Owned(format!(
             "s3://{}/{}",
             args.s3_bucket.as_deref().unwrap_or("?"),
             args.s3_key
-        )
+        ))
     };
 
     log::info!(

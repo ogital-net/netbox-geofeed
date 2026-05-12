@@ -5,6 +5,7 @@
 //! Subcommand is the first non-option positional argument, following POSIX
 //! stop-at-first-non-option semantics from `getopt-iter`.
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 
 use getopt_iter::Getopt;
@@ -81,13 +82,14 @@ pub async fn run() -> anyhow::Result<()> {
     // into (global args ending at the subcommand-exclusive split) +
     // (subcommand and its args).
     let raw_args: Vec<OsString> = std::env::args_os().collect();
-    let prog = raw_args
+    // to_string_lossy() returns Cow::Borrowed when the path is valid UTF-8
+    // (the common case), avoiding a heap allocation for the program name.
+    let prog: Cow<str> = raw_args
         .first()
         .map(|a| {
-            std::path::Path::new(a).file_name().map_or_else(
-                || a.to_string_lossy().into_owned(),
-                |s| s.to_string_lossy().into_owned(),
-            )
+            std::path::Path::new(a)
+                .file_name()
+                .map_or_else(|| a.to_string_lossy(), |s| s.to_string_lossy())
         })
         .unwrap_or_default();
 
@@ -145,9 +147,11 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Anything from `split` onwards belongs to the subcommand.
     let sub_slice = &raw_args[split..];
-    let subcommand = sub_slice
+    // to_string_lossy() returns Cow::Borrowed for valid UTF-8, avoiding an
+    // allocation in the normal case.
+    let subcommand: Cow<str> = sub_slice
         .first()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|s| s.to_string_lossy())
         .ok_or_else(|| config_err("no subcommand given (try --help)"))?;
 
     let global = GlobalConfig {
@@ -163,7 +167,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
 
-    match subcommand.as_str() {
+    match subcommand.as_ref() {
         "generate" => {
             let args = parse_generate(global, sub_argv, &prog)?;
             crate::cli::dispatch::generate(args).await
