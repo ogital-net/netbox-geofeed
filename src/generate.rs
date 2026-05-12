@@ -16,7 +16,7 @@ use sonic_rs::JsonValueTrait as _;
 
 use crate::cli::GenerateArgs;
 use crate::geofeed::{self, FeedParams, Record};
-use crate::netbox::Netbox;
+use crate::netbox::{Netbox, SitesCache};
 
 /// Entry point for the `generate` subcommand.
 ///
@@ -27,8 +27,8 @@ use crate::netbox::Netbox;
 pub async fn run(args: GenerateArgs) -> anyhow::Result<()> {
     let ts = json_ts::JsonTimestamp::now();
     let mut ts_buf = json_ts::Buffer::new();
-    let timestamp = ts_buf.format(ts).to_owned();
-    run_impl(&args, io::stdout(), &timestamp).await
+    let timestamp = ts_buf.format(ts);
+    run_impl(&args, io::stdout(), timestamp).await
 }
 
 /// Inner implementation with an injectable writer and timestamp for testability.
@@ -53,8 +53,9 @@ pub(crate) async fn run_impl<W: io::Write>(
             _ => None,
         };
 
-    let mut netbox = Netbox::new(&args.global.netbox_url, &args.global.netbox_token)
-        .context("failed to initialise NetBox client")?;
+    let netbox = Netbox::new(&args.global.netbox_url, &args.global.netbox_token)
+        .context("failed to initialize NetBox client")?;
+    let mut site_cache = SitesCache::new();
 
     let target: Cow<str> = if args.dry_run {
         Cow::Borrowed("stdout (dry-run)")
@@ -89,19 +90,24 @@ pub(crate) async fn run_impl<W: io::Write>(
     let raw_total = raw_prefixes.len() + raw_aggregates.len();
     let mut skipped: usize = 0;
     let mut skipped_non_routable: usize = 0;
-    let mut records: Vec<Record> = Vec::with_capacity(raw_total);
 
-    // --- Site-assigned prefix records ---
+    // --- Phase 1: filter + pre-populate the site cache ---
+    //
+    // Separating fetch (which needs `&mut site_cache`) from record construction
+    // (which borrows `&str` from inside `site_cache`) is what makes `Record<'_>`
+    // with borrowed fields possible — you cannot hold a `&str` into a `HashMap`
+    // while also inserting into it.
 
+    // 1a. Walk the prefix list, count non-routable and scope-less skips, and
+    //     collect (site_id, &Prefix) pairs for the surviving prefixes.
+    let mut site_prefix_pairs = Vec::new();
     for prefix in &raw_prefixes {
-        let cidr = &prefix.prefix;
-
+        let cidr: &str = &prefix.prefix;
         if !geofeed::is_globally_routable(cidr) {
             log::warn!("skipping prefix {cidr}: not globally routable");
             skipped_non_routable += 1;
             continue;
         }
-
         let Some(site_id) = prefix.scope_id else {
             // Should not happen: the stream already filtered to scope_type=dcim.site,
             // but be defensive.
@@ -109,32 +115,49 @@ pub(crate) async fn run_impl<W: io::Write>(
             skipped += 1;
             continue;
         };
+        site_prefix_pairs.push((site_id, prefix));
+    }
 
-        // Geocode inline (side effect): fill any empty geo fields on this site.
-        // Only runs when an ArcGIS token is configured and --no-write is not set.
+    // 1b. Fetch every unique site and optionally geocode it; sort IDs first
+    //     for deterministic fetch / log order.
+    let mut unique_site_ids: Vec<i64> = site_prefix_pairs
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    unique_site_ids.sort_unstable();
+
+    for site_id in unique_site_ids {
+        netbox
+            .site(site_id, &mut site_cache)
+            .await
+            .with_context(|| format!("failed to fetch site {site_id}"))?;
+
         if let Some(gc) = &geocoder
             && !args.no_write
         {
-            let site_for_geo = netbox
-                .site(site_id)
-                .await
-                .with_context(|| format!("failed to fetch site {site_id} for geocoding"))?
-                .clone(); // clone to release the &mut borrow before passing &netbox below
+            let site_for_geo = site_cache.get(site_id).expect("just fetched").clone();
             match crate::geocode::fill_missing(&site_for_geo, gc, &netbox, args.min_score, false)
                 .await
             {
-                Ok(Some(updated)) => netbox.update_cached_site(updated),
+                Ok(Some(updated)) => site_cache.update(updated),
                 Ok(None) => {}
                 Err(e) => log::warn!(
-                    "inline geocoding failed for site_id={site_id} prefix={cidr}: {e}; continuing with existing site data",
+                    "inline geocoding failed for site_id={site_id}: {e}; continuing with existing site data",
                 ),
             }
         }
+    }
 
-        let site = netbox
-            .site(site_id)
-            .await
-            .with_context(|| format!("failed to fetch site {site_id} for prefix {cidr}"))?;
+    // --- Phase 2: build records borrowing strings from the now-frozen cache ---
+
+    let mut records: Vec<Record<'_>> =
+        Vec::with_capacity(site_prefix_pairs.len() + raw_aggregates.len());
+
+    for (site_id, prefix) in &site_prefix_pairs {
+        let cidr: &str = &prefix.prefix;
+        let site = site_cache.get(*site_id).expect("pre-fetched above");
 
         let Some(country) = custom_field_str(site, "geofeed_country") else {
             log::warn!(
@@ -148,22 +171,16 @@ pub(crate) async fn run_impl<W: io::Write>(
         let region = custom_field_str(site, "geofeed_region");
         let city = custom_field_str(site, "geofeed_city");
 
-        records.push(Record::from_site_prefix(
-            cidr, country, region, city, &site.slug,
-        ));
+        records.push(Record::from_site_prefix(cidr, country, region, city, &site.slug));
     }
 
-    // --- Aggregate records ---
-
     for agg in &raw_aggregates {
-        let cidr = &agg.prefix;
-
+        let cidr: &str = &agg.prefix;
         if !geofeed::is_globally_routable(cidr) {
             log::warn!("skipping aggregate {cidr}: not globally routable");
             skipped_non_routable += 1;
             continue;
         }
-
         records.push(Record::from_aggregate(cidr, &args.aggregate_country));
     }
 
@@ -180,7 +197,7 @@ pub(crate) async fn run_impl<W: io::Write>(
     // Write to an in-memory buffer first so we can report byte count in the
     // summary log and write atomically to `out`.
     let mut buf = Vec::new();
-    geofeed::write_feed(&records, &mut buf, &params).context("failed to serialise geofeed")?;
+    geofeed::write_feed(&records, &mut buf, &params).context("failed to serialize geofeed")?;
     let bytes = buf.len();
 
     if args.dry_run {

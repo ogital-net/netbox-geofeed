@@ -23,44 +23,44 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A single line in the RFC 8805 geofeed CSV.
 #[derive(Debug)]
-pub struct Record {
+pub struct Record<'a> {
     /// IP prefix in CIDR notation, exactly as stored in `NetBox`.
-    pub prefix: String,
+    pub prefix: &'a str,
     /// ISO 3166-1 alpha-2 country code (e.g. `US`).
-    pub country: String,
+    pub country: &'a str,
     /// ISO 3166-2 subdivision code *without* the country prefix (e.g. `CA`).
     /// When present, the output ISO field is formatted as `<country>-<region>`.
-    pub region: Option<String>,
+    pub region: Option<&'a str>,
     /// UTF-8 city name; `None` is serialized as an empty string.
-    pub city: Option<String>,
+    pub city: Option<&'a str>,
     // Pre-computed sort fields; kept private to enforce construction through
     // the provided constructors.
-    sort_family: u8,          // 0 = IPv4, 1 = IPv6, 2 = unparseable (fallback)
-    sort_addr: u128,          // network address as an unsigned integer
-    sort_secondary: Option<String>, // Some(site_slug) for site prefixes; None for aggregates (falls back to prefix)
+    sort_family: u8,         // 0 = IPv4, 1 = IPv6, 2 = unparseable (fallback)
+    sort_addr: u128,         // network address as an unsigned integer
+    sort_secondary: Option<&'a str>, // Some(site_slug) for site prefixes; None = fall back to prefix
 }
 
-impl Record {
+impl<'a> Record<'a> {
     /// Construct a record from a site-assigned prefix.
     ///
     /// `site_slug` is used as the secondary sort key (see §7).
     #[must_use]
     pub fn from_site_prefix(
-        prefix: &str,
-        country: &str,
-        region: Option<&str>,
-        city: Option<&str>,
-        site_slug: &str,
+        prefix: &'a str,
+        country: &'a str,
+        region: Option<&'a str>,
+        city: Option<&'a str>,
+        site_slug: &'a str,
     ) -> Self {
         let (sort_family, sort_addr) = addr_sort_key(prefix);
         Self {
-            prefix: prefix.to_owned(),
-            country: country.to_owned(),
-            region: region.map(str::to_owned),
-            city: city.map(str::to_owned),
+            prefix,
+            country,
+            region,
+            city,
             sort_family,
             sort_addr,
-            sort_secondary: Some(site_slug.to_owned()),
+            sort_secondary: Some(site_slug),
         }
     }
 
@@ -69,11 +69,11 @@ impl Record {
     /// Only the country column is populated; region and city are left empty.
     /// The aggregate's own CIDR string is used as the secondary sort key.
     #[must_use]
-    pub fn from_aggregate(prefix: &str, country: &str) -> Self {
+    pub fn from_aggregate(prefix: &'a str, country: &'a str) -> Self {
         let (sort_family, sort_addr) = addr_sort_key(prefix);
         Self {
-            prefix: prefix.to_owned(),
-            country: country.to_owned(),
+            prefix,
+            country,
             region: None,
             city: None,
             sort_family,
@@ -83,12 +83,13 @@ impl Record {
     }
 
     /// Return the region column value: `<country>-<region>` when a region is
-    /// known, or an empty string slice otherwise.
+    /// known, or an empty string otherwise.
     ///
-    /// Returns `Cow::Borrowed("")` for records without a region to avoid
-    /// heap-allocating an empty string on every such row.
+    /// Allocates only when both country and region are present; returns
+    /// `Cow::Borrowed("")` for records without a region to avoid a heap
+    /// allocation on every such row.
     fn region_field(&self) -> Cow<'_, str> {
-        match &self.region {
+        match self.region {
             Some(r) if !r.is_empty() => Cow::Owned(format!("{}-{}", self.country, r)),
             _ => Cow::Borrowed(""),
         }
@@ -113,12 +114,11 @@ fn addr_sort_key(prefix_cidr: &str) -> (u8, u128) {
 /// Sort `records` in-place following the §7 determinism rules:
 /// IPv4 before IPv6, numeric network-address order, secondary sort on
 /// site slug / aggregate CIDR.
-pub fn sort(records: &mut [Record]) {
+pub fn sort(records: &mut [Record<'_>]) {
     records.sort_by(|a, b| {
-        // Aggregates have no explicit secondary key; fall back to the prefix
-        // CIDR string (same value that was previously duplicated into sort_secondary).
-        let a_sec = a.sort_secondary.as_deref().unwrap_or(&a.prefix);
-        let b_sec = b.sort_secondary.as_deref().unwrap_or(&b.prefix);
+        // Aggregates have no explicit secondary key; fall back to the prefix CIDR string.
+        let a_sec = a.sort_secondary.unwrap_or(a.prefix);
+        let b_sec = b.sort_secondary.unwrap_or(b.prefix);
         (a.sort_family, a.sort_addr, a_sec).cmp(&(b.sort_family, b.sort_addr, b_sec))
     });
 }
@@ -150,7 +150,7 @@ pub struct FeedParams<'a> {
 ///
 /// Returns any I/O or CSV serialization error encountered while writing.
 pub fn write_feed<W: io::Write>(
-    records: &[Record],
+    records: &[Record<'_>],
     mut out: W,
     params: &FeedParams<'_>,
 ) -> io::Result<()> {
@@ -167,10 +167,10 @@ pub fn write_feed<W: io::Write>(
 
         for record in records {
             let region = record.region_field();
-            let city = record.city.as_deref().unwrap_or("");
+            let city = record.city.unwrap_or("");
             wtr.write_record([
-                record.prefix.as_str(),
-                record.country.as_str(),
+                record.prefix,
+                record.country,
                 &*region, // deref Cow<str> → &str; no allocation when region is absent
                 city,
                 "",
@@ -184,7 +184,6 @@ pub fn write_feed<W: io::Write>(
     let digest_hex = hex_lower(digest.as_ref());
 
     // Comment header — modeled on Google Corp's published geofeed.
-    // Source URL is intentionally omitted (private operational data).
     writeln!(
         out,
         "# netbox-geofeed {} ({})",
@@ -374,14 +373,8 @@ mod tests {
         sort(&mut records);
         // aggregate secondary = None → falls back to "10.0.0.0/8"; site secondary = Some("zzz")
         // "10.0.0.0/8" < "zzz" lexicographically
-        assert_eq!(
-            records[0].sort_secondary.as_deref().unwrap_or(&records[0].prefix),
-            "10.0.0.0/8"
-        );
-        assert_eq!(
-            records[1].sort_secondary.as_deref().unwrap_or(&records[1].prefix),
-            "zzz"
-        );
+        assert_eq!(records[0].sort_secondary.unwrap_or(records[0].prefix), "10.0.0.0/8");
+        assert_eq!(records[1].sort_secondary.unwrap_or(records[1].prefix), "zzz");
     }
 
     // ── region_field ─────────────────────────────────────────────────────────
@@ -401,7 +394,7 @@ mod tests {
         let r = Record::from_site_prefix("10.0.0.0/8", "US", Some("CA"), None, "sfo1");
         assert_eq!(r.prefix, "10.0.0.0/8");
         assert_eq!(r.country, "US");
-        assert_eq!(r.region.as_deref(), Some("CA"));
+        assert_eq!(r.region, Some("CA"));
         assert_eq!(r.city, None);
         assert_eq!(r.region_field(), "US-CA");
     }
@@ -411,7 +404,7 @@ mod tests {
         let r = Record::from_site_prefix("10.0.0.0/8", "US", Some(""), None, "sfo1");
         assert_eq!(r.prefix, "10.0.0.0/8");
         assert_eq!(r.country, "US");
-        assert_eq!(r.region.as_deref(), Some(""));
+        assert_eq!(r.region, Some(""));
         assert_eq!(r.city, None);
         assert_eq!(r.region_field(), "");
     }

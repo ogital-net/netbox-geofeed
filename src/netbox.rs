@@ -21,10 +21,42 @@ use netbox_client::{
 
 const PAGE_SIZE: u32 = 50;
 
-/// Per-run `NetBox` client with memoized site lookups.
+/// A per-run memoization cache for [`Site`] lookups by numeric ID.
+///
+/// Kept separate from [`Netbox`] so callers can hold the cache independently,
+/// allowing [`Netbox::site`] to take `&self` rather than `&mut self`.
+pub struct SitesCache(HashMap<i64, Site>);
+
+impl SitesCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Insert or replace a site in the cache.
+    ///
+    /// Call this after a successful [`Netbox::site_patch`] to keep the cache
+    /// consistent for the remainder of the run.
+    pub fn update(&mut self, site: Site) {
+        self.0.insert(site.id, site);
+    }
+
+    /// Look up a site by ID without mutating the cache.
+    #[must_use]
+    pub fn get(&self, id: i64) -> Option<&Site> {
+        self.0.get(&id)
+    }
+}
+
+impl Default for SitesCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-run `NetBox` client.
 pub struct Netbox {
     client: NetboxClient,
-    sites: HashMap<i64, Site>,
 }
 
 impl Netbox {
@@ -35,10 +67,7 @@ impl Netbox {
     /// Returns an error if the underlying HTTP client cannot be constructed.
     pub fn new(url: &str, token: &str) -> anyhow::Result<Self> {
         let client = NetboxClient::new(url, token).context("failed to construct NetBox client")?;
-        Ok(Self {
-            client,
-            sites: HashMap::new(),
-        })
+        Ok(Self { client })
     }
 
     /// Stream every active, `dcim.site`-scoped prefix.
@@ -85,52 +114,36 @@ impl Netbox {
 
     /// Stream every aggregate in `NetBox` (unfiltered).
     pub fn aggregates_all(&self) -> BoxStream<'_, anyhow::Result<Aggregate>> {
-        use std::collections::VecDeque;
-
-        Box::pin(try_unfold(
-            (Some(0u32), VecDeque::<Aggregate>::new()),
-            move |(mut next_offset, mut buf)| async move {
-                // Yield any already-buffered item first.
-                if let Some(item) = buf.pop_front() {
-                    return Ok(Some((item, (next_offset, buf))));
-                }
-                // Buffer empty; fetch the next page.
-                let Some(offset) = next_offset else {
-                    return Ok(None);
-                };
-                let page = self
-                    .client
-                    .aggregates_list(PAGE_SIZE, offset, &AggregateFilter::default())
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                next_offset = page
-                    .next
-                    .is_some()
-                    .then_some(offset + page.results.len() as u32);
-                buf = page.results.into_iter().collect();
-                match buf.pop_front() {
-                    Some(item) => Ok(Some((item, (next_offset, buf)))),
-                    None => Ok(None),
-                }
-            },
-        ))
+        // The stream borrows the filter for its lifetime, so it must outlive
+        // this stack frame. A function-local static provides a 'static reference
+        // without any per-call allocation.
+        static FILTER: std::sync::LazyLock<AggregateFilter> =
+            std::sync::LazyLock::new(AggregateFilter::default);
+        Box::pin(self.client.aggregates(&FILTER).map_err(anyhow::Error::from))
     }
 
-    /// Fetch a site by ID, memoizing the result for the lifetime of this [`Netbox`].
+    /// Fetch a site by ID, memoizing the result in `cache`.
+    ///
+    /// The cache lifetime is independent of `self`, so this method takes
+    /// `&self` and can be called without a mutable borrow on [`Netbox`].
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or the site does not exist.
-    pub async fn site(&mut self, id: i64) -> anyhow::Result<&Site> {
-        if !self.sites.contains_key(&id) {
+    pub async fn site<'cache>(
+        &self,
+        id: i64,
+        cache: &'cache mut SitesCache,
+    ) -> anyhow::Result<&'cache Site> {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.0.entry(id) {
             let site = self
                 .client
                 .site(id)
                 .await
                 .with_context(|| format!("failed to fetch site {id}"))?;
-            self.sites.insert(id, site);
+            e.insert(site);
         }
-        Ok(self.sites.get(&id).expect("just inserted"))
+        Ok(cache.0.get(&id).expect("just inserted"))
     }
 
     /// PATCH a site with the supplied partial-update body.
@@ -143,14 +156,6 @@ impl Netbox {
             .site_patch(id, body)
             .await
             .with_context(|| format!("failed to PATCH site {id}"))
-    }
-
-    /// Update (or insert) a site in the memoization cache.
-    ///
-    /// Call this after [`site_patch`] to keep the cache consistent for the
-    /// remainder of the run.
-    pub fn update_cached_site(&mut self, site: Site) {
-        self.sites.insert(site.id, site);
     }
 
     /// Stream all sites matching `filter` from `NetBox`.
@@ -434,10 +439,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut nb = Netbox::new(&server.uri(), "token").unwrap();
-        let s1 = nb.site(42).await.unwrap();
+        let nb = Netbox::new(&server.uri(), "token").unwrap();
+        let mut cache = SitesCache::new();
+        let s1 = nb.site(42, &mut cache).await.unwrap();
         assert_eq!(s1.slug, "nyc");
-        let s2 = nb.site(42).await.unwrap();
+        let s2 = nb.site(42, &mut cache).await.unwrap();
         assert_eq!(s2.slug, "nyc");
         // MockServer drop verifies the expect(1) assertion.
     }
