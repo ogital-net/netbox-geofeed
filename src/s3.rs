@@ -148,7 +148,7 @@ async fn put_object_to(
     });
 
     let canonical_request =
-        format!("PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",);
+        format!("PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     let credential_scope = format!("{date_stamp}/{}/{SERVICE}/aws4_request", cfg.region);
     let string_to_sign = format!(

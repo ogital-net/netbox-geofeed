@@ -81,11 +81,12 @@ impl Record {
         }
     }
 
-    /// Return the ISO column value: `<country>` or `<country>-<region>`.
-    fn iso_field(&self) -> String {
+    /// Return the region column value: `<country>-<region>` when a region is
+    /// known, or an empty string otherwise.
+    fn region_field(&self) -> String {
         match &self.region {
             Some(r) if !r.is_empty() => format!("{}-{}", self.country, r),
-            _ => self.country.clone(),
+            _ => String::new(),
         }
     }
 }
@@ -161,10 +162,16 @@ pub fn write_feed<W: io::Write>(
             .from_writer(&mut body);
 
         for record in records {
-            let iso = record.iso_field();
+            let region = record.region_field();
             let city = record.city.as_deref().unwrap_or("");
-            wtr.write_record([record.prefix.as_str(), &iso, city, "", ""])
-                .map_err(io::Error::other)?;
+            wtr.write_record([
+                record.prefix.as_str(),
+                record.country.as_str(),
+                &region,
+                city,
+                "",
+            ])
+            .map_err(io::Error::other)?;
         }
         wtr.flush()?;
     }
@@ -367,24 +374,234 @@ mod tests {
         assert_eq!(records[1].sort_secondary, "zzz");
     }
 
-    // ── iso_field ────────────────────────────────────────────────────────────
+    // ── region_field ─────────────────────────────────────────────────────────
 
     #[test]
-    fn iso_field_country_only() {
+    fn region_field_country_only() {
         let r = Record::from_aggregate("10.0.0.0/8", "US");
-        assert_eq!(r.iso_field(), "US");
+        assert_eq!(r.prefix, "10.0.0.0/8");
+        assert_eq!(r.country, "US");
+        assert_eq!(r.region, None);
+        assert_eq!(r.city, None);
+        assert_eq!(r.region_field(), "");
     }
 
     #[test]
-    fn iso_field_country_and_region() {
+    fn region_field_country_and_region() {
         let r = Record::from_site_prefix("10.0.0.0/8", "US", Some("CA"), None, "sfo1");
-        assert_eq!(r.iso_field(), "US-CA");
+        assert_eq!(r.prefix, "10.0.0.0/8");
+        assert_eq!(r.country, "US");
+        assert_eq!(r.region.as_deref(), Some("CA"));
+        assert_eq!(r.city, None);
+        assert_eq!(r.region_field(), "US-CA");
     }
 
     #[test]
-    fn iso_field_empty_region_treated_as_absent() {
+    fn region_field_empty_region_treated_as_absent() {
         let r = Record::from_site_prefix("10.0.0.0/8", "US", Some(""), None, "sfo1");
-        assert_eq!(r.iso_field(), "US");
+        assert_eq!(r.prefix, "10.0.0.0/8");
+        assert_eq!(r.country, "US");
+        assert_eq!(r.region.as_deref(), Some(""));
+        assert_eq!(r.city, None);
+        assert_eq!(r.region_field(), "");
+    }
+
+    // ── RFC 8805 compliance ───────────────────────────────────────────────────
+
+    /// Serialize `records` through `write_feed` and return the non-comment
+    /// CSV rows as `Vec<Vec<String>>`, splitting each line on commas.
+    ///
+    /// The helper sorts the records first, matching the production code path.
+    fn feed_rows(mut records: Vec<Record>) -> Vec<Vec<String>> {
+        sort(&mut records);
+        let mut buf = Vec::new();
+        write_feed(
+            &records,
+            &mut buf,
+            &FeedParams {
+                timestamp: "2024-01-01T00:00:00Z",
+                version: "0.1.0",
+                git_sha: "test",
+            },
+        )
+        .expect("write_feed must not fail");
+        String::from_utf8(buf)
+            .expect("output must be valid UTF-8")
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(|l| l.split(',').map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// RFC 8805 §2.1: every data row must carry exactly five comma-separated
+    /// fields: `ip_prefix,alpha2code,region,city,postal_code`.
+    #[test]
+    fn each_row_has_exactly_five_fields() {
+        let records = vec![
+            Record::from_aggregate("1.2.3.0/24", "US"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+            Record::from_site_prefix("8.0.0.0/8", "DE", None, None, "ber1"),
+        ];
+        for row in feed_rows(records) {
+            assert_eq!(row.len(), 5, "expected 5 fields, got: {row:?}");
+        }
+    }
+
+    /// RFC 8805 §2.1.1.2: alpha2code must be a 2-letter ISO 3166-1 alpha-2
+    /// uppercase code or an empty string. It must never contain the country +
+    /// region joined together.
+    #[test]
+    fn alpha2code_is_two_uppercase_letters() {
+        let records = vec![
+            Record::from_aggregate("1.2.3.0/24", "US"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+            Record::from_site_prefix("8.0.0.0/8", "DE", Some("BE"), Some("Berlin"), "ber1"),
+        ];
+        for row in feed_rows(records) {
+            let code = &row[1];
+            assert!(
+                code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()),
+                "alpha2code {code:?} must be exactly 2 uppercase ASCII letters"
+            );
+        }
+    }
+
+    /// RFC 8805 §2.1.1.3: region must be in ISO 3166-2 `CC-SUB` format or
+    /// empty. It must never hold only a subdivision code without the country
+    /// prefix.
+    #[test]
+    fn region_is_iso3166_2_or_empty() {
+        let records = vec![
+            Record::from_aggregate("1.2.3.0/24", "US"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+            Record::from_site_prefix("8.0.0.0/8", "DE", None, None, "ber1"),
+        ];
+        for row in feed_rows(records) {
+            let region = &row[2];
+            if region.is_empty() {
+                continue;
+            }
+            let Some((cc, sub)) = region.split_once('-') else {
+                panic!("region {region:?} is not in CC-SUB format");
+            };
+            assert!(
+                cc.len() == 2 && cc.chars().all(|c| c.is_ascii_uppercase()),
+                "region country prefix {cc:?} must be 2 uppercase letters"
+            );
+            assert!(
+                !sub.is_empty(),
+                "subdivision in {region:?} must not be empty"
+            );
+        }
+    }
+
+    /// RFC 8805 §2.1.1.3: when the region field is non-empty, its country
+    /// prefix must match the alpha2code field exactly.
+    #[test]
+    fn region_country_prefix_matches_alpha2code() {
+        let records = vec![
+            Record::from_site_prefix("1.2.3.0/24", "US", Some("NY"), Some("New York"), "nyc1"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+            Record::from_site_prefix("8.0.0.0/8", "DE", Some("BE"), Some("Berlin"), "ber1"),
+        ];
+        for row in feed_rows(records) {
+            let country = &row[1];
+            let region = &row[2];
+            if region.is_empty() {
+                continue;
+            }
+            let cc = region.split('-').next().unwrap();
+            assert_eq!(
+                cc, country,
+                "region CC prefix {cc:?} must match alpha2code {country:?}"
+            );
+        }
+    }
+
+    /// RFC 8805 §2.1.1.5: postal code is deprecated; this tool never emits
+    /// one. The column must be present but always empty.
+    #[test]
+    fn postal_code_is_always_empty() {
+        let records = vec![
+            Record::from_aggregate("1.2.3.0/24", "US"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+        ];
+        for row in feed_rows(records) {
+            assert_eq!(row[4], "", "postal code (field 5) must always be empty");
+        }
+    }
+
+    /// RFC 8805 §2.1.1.4: city SHOULD exclude the comma character.
+    #[test]
+    fn city_contains_no_commas() {
+        let records = vec![
+            Record::from_site_prefix("1.2.3.0/24", "US", Some("NY"), Some("New York"), "nyc1"),
+            Record::from_site_prefix("5.6.7.0/24", "GB", Some("ENG"), Some("London"), "lon1"),
+        ];
+        for row in feed_rows(records) {
+            assert!(
+                !row[3].contains(','),
+                "city {:?} must not contain a comma",
+                row[3]
+            );
+        }
+    }
+
+    /// Aggregates contribute only the alpha2code (country) column; region,
+    /// city, and postal code must all be empty.
+    #[test]
+    fn aggregate_row_emits_country_only() {
+        let records = vec![Record::from_aggregate("1.2.3.0/24", "US")];
+        let rows = feed_rows(records);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row[0], "1.2.3.0/24");
+        assert_eq!(row[1], "US");
+        assert_eq!(row[2], "", "aggregate region must be empty");
+        assert_eq!(row[3], "", "aggregate city must be empty");
+        assert_eq!(row[4], "", "aggregate postal code must be empty");
+    }
+
+    /// Site-prefix rows must emit all five geo fields in the correct columns.
+    #[test]
+    fn site_prefix_row_emits_all_geo_fields() {
+        let records = vec![Record::from_site_prefix(
+            "1.2.3.0/24",
+            "US",
+            Some("NY"),
+            Some("New York"),
+            "nyc1",
+        )];
+        let rows = feed_rows(records);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row[0], "1.2.3.0/24");
+        assert_eq!(row[1], "US");
+        assert_eq!(row[2], "US-NY");
+        assert_eq!(row[3], "New York");
+        assert_eq!(row[4], "");
+    }
+
+    /// A site-prefix with no region must still emit an empty region column and
+    /// a populated alpha2code — the country must not migrate into the region
+    /// slot.
+    #[test]
+    fn site_prefix_without_region_leaves_region_column_empty() {
+        let records = vec![Record::from_site_prefix(
+            "8.0.0.0/8",
+            "DE",
+            None,
+            Some("Berlin"),
+            "ber1",
+        )];
+        let rows = feed_rows(records);
+        let row = &rows[0];
+        assert_eq!(row[1], "DE");
+        assert_eq!(
+            row[2], "",
+            "region column must be empty when no region is known"
+        );
+        assert_eq!(row[3], "Berlin");
     }
 
     // ── write_feed / golden-file ──────────────────────────────────────────────

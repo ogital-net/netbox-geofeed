@@ -104,7 +104,7 @@ pub(crate) async fn run_impl<W: io::Write>(
         let Some(site_id) = prefix.scope_id else {
             // Should not happen: the stream already filtered to scope_type=dcim.site,
             // but be defensive.
-            log::warn!("skipping prefix {cidr}: missing scope_id on dcim.site-scoped prefix",);
+            log::warn!("skipping prefix {cidr}: missing scope_id on dcim.site-scoped prefix");
             skipped += 1;
             continue;
         };
@@ -503,9 +503,9 @@ mod tests {
 # Self-published geofeed as defined in datatracker.ietf.org/doc/html/rfc8805
 # Last updated (rfc3339): 2024-01-01T00:00:00Z
 # Number of records: 3, checksum of the actual content minus comments:
-# SHA256 = 47f90a6aa706a0cf14714abe7b05a2e28eadc4f7723546e8dc95f3bbfde817ab
-1.2.3.0/24,US-NY,New York,,
-5.6.7.0/24,GB-ENG,London,,
+# SHA256 = f57fe3112c1c39a8384644771288b45ae8190d3a9c242589e2b52f3f74a397c3
+1.2.3.0/24,US,US-NY,New York,
+5.6.7.0/24,GB,GB-ENG,London,
 8.0.0.0/8,US,,,
 ",
             ver = env!("CARGO_PKG_VERSION"),
